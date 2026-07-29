@@ -1,6 +1,6 @@
-# Advanced RAG Pipeline for Document Q&A
+# Simple RAG Pipeline for Document Q&A
 
-This project implements an advanced **Retrieval-Augmented Generation (RAG)** pipeline designed for querying a local collection of PDF documents. It leverages local language models and embedding models to ensure privacy and control. The system is built with a sophisticated, multi-step agentic workflow that includes query decomposition and reranking to provide accurate, cited answers.
+This project implements a simple **Retrieval-Augmented Generation (RAG)** pipeline designed for querying a local collection of PDF documents. It leverages local language models and embedding models to ensure privacy and control. The system is built with a sophisticated, multi-step agentic workflow that includes query decomposition and reranking to provide accurate, cited answers.
 
 ---
 
