@@ -175,3 +175,71 @@ def test_coverage_rewards_complete_answers():
     r_partial, p1 = answer_reward(partial, ex, _fake_nli)
     r_full, p2 = answer_reward(full, ex, _fake_nli)
     assert p1["coverage"] == 0.5 and p2["coverage"] == 1.0 and r_full > r_partial
+
+
+def test_maxsim_matches_bruteforce():
+    import torch
+    from localrag.retrieval.colbert import maxsim, pad_docs
+    torch.manual_seed(0)
+    docs = [torch.nn.functional.normalize(torch.randn(n, 8), dim=-1) for n in (3, 5, 2)]
+    q = torch.nn.functional.normalize(torch.randn(4, 8), dim=-1)
+    padded, mask = pad_docs(docs)
+    expected = torch.tensor([(q @ d.T).max(dim=1).values.sum() for d in docs])
+    assert torch.allclose(maxsim(q, padded, mask), expected, atol=1e-5)   # padding never wins a max
+
+
+def _index_with(chunks):
+    from localrag.retrieval.index import Index
+    idx = Index("unused", "unused")
+    idx._chunks = {c.id: c for c in chunks}
+    return idx
+
+
+def test_context_expansion_stays_in_section_and_tracks_pages():
+    from localrag.types import Chunk
+    chunks = [Chunk("a", "A1.", "d.pdf", 1, "S1"), Chunk("b", "B2.", "d.pdf", 2, "S2"),
+              Chunk("c", "C3.", "d.pdf", 3, "S2"), Chunk("e", "E4.", "d.pdf", 4, "S2"),
+              Chunk("f", "F5.", "d.pdf", 5, "S3")]
+    idx = _index_with(chunks)
+    win = idx.expand(chunks[2], "window", window=1)
+    assert win.text == "B2.\nC3.\nE4." and (win.page, win.page_end) == (2, 4)
+    sec = idx.expand(chunks[1], "section")
+    assert sec.text == "B2.\nC3.\nE4." and ("d.pdf", 3) in sec.pages and ("d.pdf", 5) not in sec.pages
+    assert idx.expand(chunks[2], "section", max_chars=8).text.count("\n") == 1   # budget respected
+    assert idx.expand(chunks[0], "chunk") is chunks[0]
+
+
+def test_compression_keeps_top_sentences_in_order():
+    from types import SimpleNamespace as NS
+    from localrag.agents import compress
+    from localrag.types import Chunk, Hit
+    text = "Alpha is first. Beta is second. Gamma is third. Delta is fourth."
+    scorer = NS(score=lambda pairs: [1.0 if ("Gamma" in s or "Alpha" in s) else 0.0 for _, s in pairs])
+    out = compress([Hit(Chunk("x", text, "d.pdf", 1), 1.0)], "q", scorer, keep=2)
+    assert out[0].chunk.text == "Alpha is first. … Gamma is third."
+
+
+def test_next_search_stops_when_nothing_missing():
+    from types import SimpleNamespace as NS
+    from localrag.agents import next_search
+    from localrag.types import Chunk, Hit
+    hits = [Hit(Chunk("x", "text", "d.pdf", 1), 1.0)]
+    llm = lambda out: NS(json=lambda *a, **k: out)
+    assert next_search(llm({"missing": "nothing", "query": "x"}), "q", hits) is None
+    assert next_search(llm({"missing": "the EU side", "query": ""}), "q", hits) is None
+    assert next_search(llm({"missing": "the cybersecurity side", "query": "SBOM requirements"}), "q", hits) == "SBOM requirements"
+
+
+def test_anti_refusal_pairs_mirror_refusals_as_minimal_pairs():
+    from localrag.rl.train import REFUSAL_ANSWER, anti_refusal_pairs
+    def prompt(q, passages):
+        return [{"role": "system", "content": "s"}, {"role": "user", "content": f"Passages:\n{passages}\n\nQuestion: {q}"}]
+    good = '{"claims": [{"text": "x", "citations": [1]}]}'
+    answer = [{"prompt": prompt("Q1", "gold"), "chosen": good, "rejected": "r"},
+              {"prompt": prompt("Q2", "gold"), "chosen": good, "rejected": "r"},
+              {"prompt": prompt("Q3", "gold"), "chosen": good, "rejected": "r"}]
+    refusal = [{"prompt": prompt("Q2", "no gold"), "chosen": REFUSAL_ANSWER, "rejected": good},
+               {"prompt": prompt("Q9", "no gold"), "chosen": REFUSAL_ANSWER, "rejected": good}]
+    anti = anti_refusal_pairs(answer, refusal)
+    assert len(anti) == 2 and all(p["rejected"] == REFUSAL_ANSWER and p["chosen"] == good for p in anti)
+    assert "Question: Q2" in anti[0]["prompt"][-1]["content"]        # the minimal pair comes first

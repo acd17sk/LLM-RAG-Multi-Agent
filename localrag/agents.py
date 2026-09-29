@@ -3,6 +3,7 @@ so even a sub-1B model cannot emit malformed JSON or cite a passage that doesn't
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 
 from localrag.llm import LLM
 from localrag.retrieval.bm25 import tokenize
@@ -71,6 +72,66 @@ Write ONE different search query that is more likely to find the answer: use the
 
 Question: {query}"""
     return llm.json([{"role": "user", "content": prompt}], REWRITE_SCHEMA, max_tokens=120, temperature=0)["query"].strip()
+
+
+NEXT_SEARCH_SCHEMA = {
+    "type": "object",
+    "properties": {"missing": {"type": "string", "maxLength": 200},
+                   "query": {"type": "string", "maxLength": 200}},
+    "required": ["missing", "query"],
+}
+_NOTHING = re.compile(r"^\W*(nothing|none|n/?a|no(thing)? (is )?missing)\b", re.I)
+
+
+def next_search(llm: LLM, query: str, hits: list[Hit]) -> str | None:
+    """Iterative retrieval step: which part of the question do the passages NOT cover yet?
+    Returns a follow-up search query, or None when the passages suffice.
+
+    The model first writes what is missing, and only then a query: asking for a yes/no
+    "enough?" decision up front makes small models answer "yes" without reading.
+    """
+    listing = "\n\n".join(f"[{i}] {h.chunk.text[:700]}" for i, h in enumerate(hits, start=1))
+    prompt = f"""Passages found so far:
+{listing}
+
+Question: {query}
+
+In "missing", write which specific information needed to fully answer the question is NOT in the passages (for comparisons: is every side covered?). Write "nothing" if the passages already cover it.
+In "query", write one short search query that would find the missing information, or "" if nothing is missing.
+Respond with JSON only: {{"missing": "...", "query": "..."}}"""
+    out = llm.json([{"role": "user", "content": prompt}], NEXT_SEARCH_SCHEMA, max_tokens=150, temperature=0)
+    q = out["query"].strip()
+    if _NOTHING.match(out["missing"].strip()) or not q or q.lower() == query.strip().lower():
+        return None
+    return q
+
+
+_SENT_SPLIT = re.compile(r"(?<=[.!?;])\s+(?=[A-Z(\"'§0-9])")
+
+
+def compress(hits: list[Hit], query: str, scorer, keep: int) -> list[Hit]:
+    """Extractive compression (RECOMP-style, with the reranker as sentence scorer): keep the `keep`
+    most query-relevant sentences of each passage, in their original order, marking gaps with "…"."""
+    out, pairs, spans = [], [], []
+    for h in hits:
+        sents = [x for x in _SENT_SPLIT.split(h.chunk.text) if x.strip()]
+        spans.append((len(pairs), sents))
+        pairs.extend((query, x) for x in sents)
+    scores = scorer.score(pairs) if pairs else []
+    for h, (start, sents) in zip(hits, spans):
+        if len(sents) <= keep:
+            out.append(h)
+            continue
+        ranked = sorted(range(len(sents)), key=lambda i: scores[start + i], reverse=True)[:keep]
+        parts, prev = [], None
+        for i in sorted(ranked):
+            if prev is not None and i != prev + 1:
+                parts.append("…")
+            parts.append(sents[i])
+            prev = i
+        chunk = replace(h.chunk, text=" ".join(parts))
+        out.append(Hit(chunk, h.score, h.scores))
+    return out
 
 
 def self_correction_feedback(claims: list[Claim]) -> str:

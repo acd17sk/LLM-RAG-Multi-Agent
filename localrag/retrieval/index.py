@@ -43,7 +43,8 @@ def load_splade(name: str):
 
 def release_models() -> None:
     """Free GPU memory held by cached torch models (between eval variants)."""
-    for f in (load_embedder, load_cross_encoder, load_splade):
+    from localrag.retrieval.colbert import load_colbert
+    for f in (load_embedder, load_cross_encoder, load_splade, load_colbert):
         f.cache_clear()
     gc.collect()
     try:
@@ -114,6 +115,8 @@ class Index:
         self._children: dict[str, Chunk] | None = None
         self._bm25: BM25 | None = None
         self._splade: dict[str, SpladeIndex] = {}
+        self._colbert = {}
+        self._order: dict[str, int] | None = None
 
     # ---------- building ----------
     def build(self, chunks: list[Chunk], children: list[Chunk] | None = None,
@@ -126,8 +129,9 @@ class Index:
         self._chunks = self._children = None
         units = self.units
         BM25(k1, b).fit([c.id for c in units], [c.index_text for c in units]).save(self.dir / "bm25.json")
-        for p in self.dir.glob("splade-*.json"):
-            p.unlink()
+        for pattern in ("splade-*.json", "colbert-*.pt"):
+            for p in self.dir.glob(pattern):
+                p.unlink()
         self.build_dense()
         self._bm25, self._splade = None, {}
 
@@ -211,3 +215,50 @@ class Index:
                 self._splade[model] = SpladeIndex.build(model, [c.id for c in units], [c.index_text for c in units])
                 self._splade[model].save(path)
         return self._splade[model].search(model, query, k)
+
+    def colbert_search(self, model: str, query: str, k: int) -> list[tuple[str, float]]:
+        from localrag.retrieval.colbert import LateInteractionIndex
+        if model not in self._colbert:
+            path = self.dir / f"colbert-{_slug(model)}.pt"
+            if path.exists():
+                self._colbert[model] = LateInteractionIndex.load(path)
+            else:
+                print(f"Building late-interaction index with {model} ...")
+                units = self.units
+                self._colbert[model] = LateInteractionIndex.build(model, [c.id for c in units],
+                                                                  [c.index_text for c in units])
+                self._colbert[model].save(path)
+        return self._colbert[model].search(model, query, k)
+
+    # ---------- context expansion ("retrieve less, read more") ----------
+    @property
+    def order(self) -> dict[str, int]:
+        """Document-order position of every chunk (chunks.jsonl is written in reading order)."""
+        if self._order is None:
+            self._order = {cid: i for i, cid in enumerate(self.chunks)}
+        return self._order
+
+    def expand(self, chunk: Chunk, mode: str, window: int = 1, max_chars: int = 4000) -> Chunk:
+        """The chunk plus its neighbours in the same section ("window"), or its whole section
+        ("section"), grown outward from the hit until max_chars. Page range is kept for citations."""
+        if mode == "chunk":
+            return chunk
+        seq = list(self.chunks.values())
+        pos = self.order[chunk.id]
+        same = lambda c: c.source == chunk.source and c.section == chunk.section
+        lo = hi = pos
+        size = len(chunk.text)
+        limit = window if mode == "window" else len(seq)
+        for _ in range(limit):
+            grew = False
+            for cand in (lo - 1, hi + 1):
+                if 0 <= cand < len(seq) and same(seq[cand]) and size + len(seq[cand].text) <= max_chars:
+                    size += len(seq[cand].text)
+                    lo, hi = min(lo, cand), max(hi, cand)
+                    grew = True
+            if not grew:
+                break
+        parts = seq[lo:hi + 1]
+        return Chunk(chunk.id, "\n".join(c.text for c in parts), chunk.source,
+                     min(c.page for c in parts), chunk.section, chunk.context,
+                     page_end=max(c.page for c in parts))

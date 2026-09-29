@@ -18,6 +18,11 @@ class Retriever:
             return [i for i, _ in self.index.splade_search(self.cfg.splade_model, q, self.cfg.fetch_k)]
         return [i for i, _ in self.index.sparse_search(q, self.cfg.fetch_k)]
 
+    def _dense(self, q: str) -> list[str]:
+        if self.cfg.dense_backend == "late_interaction":
+            return [i for i, _ in self.index.colbert_search(self.cfg.colbert_model, q, self.cfg.fetch_k)]
+        return [i for i, _ in self.index.dense_search(q, self.cfg.fetch_k)]
+
     def candidates(self, queries: list[str]) -> list[Hit]:
         """Every (query, retriever) pair contributes one ranking; RRF fuses them all.
 
@@ -30,7 +35,7 @@ class Retriever:
         for qi, q in enumerate(queries):
             w = 2.0 if qi == 0 else 1.0
             if self.cfg.mode in ("dense", "hybrid"):
-                rankings.append([i for i, _ in self.index.dense_search(q, self.cfg.fetch_k)])
+                rankings.append(self._dense(q))
                 weights.append(w)
             if self.cfg.mode in ("sparse", "hybrid"):
                 rankings.append(self._sparse(q))

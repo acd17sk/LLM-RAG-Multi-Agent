@@ -1,6 +1,7 @@
 """Optional preference / RL fine-tuning of the small generator with LoRA.
 
     python -m localrag train dpo              # preference pairs ranked by the verifiable reward
+    python -m localrag train dpo-refusal      # + refusal pairs (unanswerable / evidence removed)
     python -m localrag train grpo             # online RL with the same reward (answer step)
     python -m localrag train grpo-decompose   # online RL for query decomposition (retrieval recall reward)
 
@@ -20,7 +21,7 @@ from localrag.rl.export import lora_to_gguf
 from localrag.retrieval.index import release_models
 from localrag.rl.rewards import AnswerExample, RewardWeights, answer_reward, decompose_reward
 
-STEP_OF = {"dpo": "answer", "grpo": "answer", "grpo-decompose": "decompose"}
+STEP_OF = {"dpo": "answer", "dpo-refusal": "answer", "grpo": "answer", "grpo-decompose": "decompose"}
 
 
 def _tokenizer(cfg: Config):
@@ -87,29 +88,88 @@ def build_dpo_pairs(cfg: Config, rows: list[dict], scorer, seed: int = 0) -> lis
     return pairs
 
 
-def train_dpo(cfg: Config, limit: int | None = None) -> Path:
-    from datasets import Dataset
-    from trl import DPOConfig, DPOTrainer
-
+def _answer_pairs(cfg: Config, limit: int | None) -> list[dict]:
     pairs_file = Path(cfg.rl.output_dir) / "dpo_pairs.jsonl"
     if pairs_file.exists() and not limit:
         # sampling is the slow part; delete the file to re-sample
         pairs = [json.loads(line) for line in open(pairs_file)]
         print(f"reusing {len(pairs)} preference pairs from {pairs_file}")
-    else:
-        rows = data.answer_examples(cfg, "train", limit)
-        pairs = build_dpo_pairs(cfg, rows, _nli(cfg))
-        Path(cfg.rl.output_dir).mkdir(exist_ok=True)
-        with open(pairs_file, "w") as f:
-            for p in pairs:
-                f.write(json.dumps(p, ensure_ascii=False) + "\n")
-        print(f"{len(pairs)} preference pairs from {len(rows)} train prompts")
-    release_models()   # free the NLI / retrieval models before training
+        return pairs
+    rows = data.answer_examples(cfg, "train", limit)
+    pairs = build_dpo_pairs(cfg, rows, _nli(cfg))
+    Path(cfg.rl.output_dir).mkdir(exist_ok=True)
+    with open(pairs_file, "w") as f:
+        for p in pairs:
+            f.write(json.dumps(p, ensure_ascii=False) + "\n")
+    print(f"{len(pairs)} preference pairs from {len(rows)} train prompts")
+    return pairs
 
+
+REFUSAL_ANSWER = json.dumps({"claims": []})
+
+
+def build_refusal_pairs(cfg: Config, scorer, max_counterfactual: int = 80, seed: int = 0) -> list[dict]:
+    """Pairs that teach *when* to refuse: chosen = empty claim list, rejected = the base model's answer.
+
+    Two sources, both from the train split:
+      unanswerable     questions the corpus does not answer (already judge-filtered)
+      counterfactual   answerable questions with the gold pages removed from the retrieved passages,
+                       kept only if NLI confirms the remaining passages do not entail the reference
+                       answer, i.e. the evidence genuinely isn't there
+    """
+    from localrag.agents import format_passages, grounded_request
+    from localrag.eval import dataset as ds
+    from localrag.llm import get_llm, release_llms
+    from localrag.rl.rewards import _SENTENCES, parse_claims
+
+    rng = random.Random(seed)
+    retriever = data._retriever(cfg)
+    train = [i for i in ds.load(cfg.eval.dataset) if ds.split_of(i) == "train"]
+    cases = [("unanswerable", it, retriever.retrieve(it["question"])) for it in train if not it["answerable"]]
+
+    singles = [i for i in train if i["answerable"] and i.get("type") == "single"]
+    rng.shuffle(singles)
+    n_cf = 0
+    for it in singles:
+        if n_cf >= max_counterfactual:
+            break
+        gold = {tuple(g) for g in it["gold"]}
+        hits = [h for h in retriever.retrieve(it["question"], k=4 * cfg.retrieval.top_k)
+                if (h.chunk.source, h.chunk.page) not in gold][:cfg.retrieval.top_k]
+        ref = [x for x in _SENTENCES.split(it["answer"]) if len(x.split()) >= 4]
+        if not hits or not ref:
+            continue
+        entail = scorer([(r, h.chunk.text) for r in ref for h in hits])
+        if max(entail) < 0.5:          # no remaining passage supports any part of the reference
+            cases.append(("counterfactual", it, hits))
+            n_cf += 1
+
+    llm = get_llm(cfg.llm)
+    pairs = []
+    for kind, it, hits in cases:
+        messages, schema = grounded_request(it["question"], format_passages(hits))
+        for _ in range(3):             # find a sampled answer that makes claims (the behaviour to unlearn)
+            answer = llm.chat(messages, schema=schema, max_tokens=cfg.rl.max_completion_length,
+                              temperature=0.8, seed=rng.randrange(2**31))
+            if parse_claims(answer, len(hits)):
+                pairs.append({"prompt": messages, "chosen": REFUSAL_ANSWER, "rejected": answer, "kind": kind})
+                break
+    release_llms()
+    print(f"refusal pairs: {sum(p['kind'] == 'unanswerable' for p in pairs)} unanswerable, "
+          f"{sum(p['kind'] == 'counterfactual' for p in pairs)} counterfactual")
+    return pairs
+
+
+def _train_dpo_on(cfg: Config, pairs: list[dict], name: str, sft_weight: float = 0.0) -> Path:
+    from datasets import Dataset
+    from trl import DPOConfig, DPOTrainer
+
+    release_models()   # free the NLI / retrieval models before training
     tok = _tokenizer(cfg)
     ds = Dataset.from_list([{"prompt": _render(tok, p["prompt"]), "chosen": p["chosen"], "rejected": p["rejected"]}
                             for p in pairs])
-    args = DPOConfig(output_dir=str(Path(cfg.rl.output_dir) / "runs" / "dpo"), beta=cfg.rl.dpo_beta,
+    loss = {"loss_type": ["sigmoid", "sft"], "loss_weights": [1.0, sft_weight]} if sft_weight else {}
+    args = DPOConfig(output_dir=str(Path(cfg.rl.output_dir) / "runs" / name), beta=cfg.rl.dpo_beta, **loss,
                      learning_rate=cfg.rl.learning_rate, num_train_epochs=cfg.rl.dpo_epochs, max_steps=cfg.rl.max_steps,
                      per_device_train_batch_size=cfg.rl.batch_size, gradient_accumulation_steps=cfg.rl.grad_accum,
                      max_length=cfg.rl.max_length, bf16=True, gradient_checkpointing=True, logging_steps=5,
@@ -117,7 +177,63 @@ def train_dpo(cfg: Config, limit: int | None = None) -> Path:
     trainer = DPOTrainer(model=_model(cfg), args=args, train_dataset=ds, processing_class=tok,
                          peft_config=_peft(cfg))
     trainer.train()
-    return _finish(trainer, cfg, "dpo")
+    return _finish(trainer, cfg, name)
+
+
+def train_dpo(cfg: Config, limit: int | None = None) -> Path:
+    return _train_dpo_on(cfg, _answer_pairs(cfg, limit), "dpo")
+
+
+def _question(prompt: list[dict]) -> str:
+    return prompt[-1]["content"].rsplit("Question:", 1)[-1].strip()
+
+
+def anti_refusal_pairs(answer_pairs: list[dict], refusal_pairs: list[dict], seed: int = 0) -> list[dict]:
+    """Mirror image of the refusal pairs: evidence present -> the good answer is chosen and the
+    empty refusal is REJECTED. Wherever possible these are minimal pairs with the counterfactuals
+    (same question; only the presence of the evidence differs), so the model has to read the
+    passages to tell the two cases apart."""
+    from localrag.rl.rewards import parse_claims
+
+    usable = [p for p in answer_pairs if parse_claims(p["chosen"], 99)]
+    by_question = {_question(p["prompt"]): p for p in usable}
+    picked, used = [], set()
+    for r in refusal_pairs:
+        match = by_question.get(_question(r["prompt"]))
+        if match is not None and id(match) not in used:
+            picked.append(match)
+            used.add(id(match))
+    rest = [p for p in usable if id(p) not in used]
+    random.Random(seed).shuffle(rest)
+    picked += rest[:max(0, len(refusal_pairs) - len(picked))]
+    return [{"prompt": p["prompt"], "chosen": p["chosen"], "rejected": REFUSAL_ANSWER, "kind": "anti_refusal"}
+            for p in picked]
+
+
+def train_dpo_refusal(cfg: Config, limit: int | None = None) -> Path:
+    """DPO on answer pairs + refusal pairs + mirrored anti-refusal pairs, with an SFT anchor (RPO).
+
+    A first version trained on answer + refusal pairs only and collapsed to refusing everything:
+    the refusal string was only ever *chosen*, so raising its likelihood everywhere satisfied every
+    preference. The anti-refusal pairs make the same string *rejected* whenever evidence is present.
+    """
+    answer = _answer_pairs(cfg, limit)
+    refusal_file = Path(cfg.rl.output_dir) / "dpo_refusal_pairs.jsonl"
+    if refusal_file.exists() and not limit:
+        refusal = [json.loads(line) for line in open(refusal_file)]
+        print(f"reusing {len(refusal)} refusal pairs from {refusal_file}")
+    else:
+        refusal = build_refusal_pairs(cfg, _nli(cfg))
+        with open(refusal_file, "w") as f:
+            for p in refusal:
+                f.write(json.dumps(p, ensure_ascii=False) + "\n")
+    anti = anti_refusal_pairs(answer, refusal)
+    minimal = len({_question(p["prompt"]) for p in anti} & {_question(p["prompt"]) for p in refusal})
+    print(f"training on {len(answer)} answer + {len(refusal)} refusal + {len(anti)} anti-refusal pairs "
+          f"({minimal} minimal pairs), SFT weight {cfg.rl.refusal_sft_weight}")
+    pairs = answer + refusal + anti
+    random.Random(0).shuffle(pairs)
+    return _train_dpo_on(cfg, pairs, "dpo-refusal", sft_weight=cfg.rl.refusal_sft_weight)
 
 
 # ------------------------------------------------------------------ GRPO
@@ -182,4 +298,5 @@ def train_grpo_decompose(cfg: Config, limit: int | None = None) -> Path:
     return _finish(trainer, cfg, "grpo-decompose")
 
 
-TRAINERS = {"dpo": train_dpo, "grpo": train_grpo, "grpo-decompose": train_grpo_decompose}
+TRAINERS = {"dpo": train_dpo, "dpo-refusal": train_dpo_refusal, "grpo": train_grpo,
+            "grpo-decompose": train_grpo_decompose}

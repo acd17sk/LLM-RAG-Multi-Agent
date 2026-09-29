@@ -72,8 +72,7 @@ def generate_variant(cfg: Config, items: list[dict], out_path: Path) -> None:
                 row[f"all@{k}"] = _all_at_k(pages, gold, k)
             row["mrr"] = mrr(pages, gold)
             row["ndcg@10"] = ndcg_at_k(pages, gold, 10)
-            used = {(ans.passages[i - 1].chunk.source, ans.passages[i - 1].chunk.page)
-                    for c in kept for i in c.citations}
+            used = set().union(*[ans.passages[i - 1].chunk.pages for c in kept for i in c.citations])
             row["cites_gold"] = float(bool(used & gold))
             row["cites_all_gold"] = float(gold <= used)
         rows.append(row)

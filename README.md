@@ -27,6 +27,28 @@ answer ◄── self-correction ◄── claim verification ◄── grounded
             with feedback)         reranker, per claim)    DPO/GRPO adapter)
 ```
 
+### Pipeline options
+
+Every stage is selectable. Where one technique *replaces* another, the parameter is a string:
+
+| Stage | Parameter | Options (default first) |
+|---|---|---|
+| Parser | `ingest.parser` | `pymupdf` (hand-written) · `docling` |
+| Sparse retrieval | `retrieval.sparse` | `bm25` · `splade` |
+| Dense retrieval | `retrieval.dense_backend` | `bi_encoder` · `late_interaction` (ColBERT MaxSim) |
+| Retrieval mix | `retrieval.mode` | `hybrid` · `dense` · `sparse` |
+| Reranker | `retrieval.reranker_backend` | `cross_encoder` · `llama` (Qwen3-Reranker) |
+| Retrieval control | `agent.retrieval_strategy` | `single` · `iterative` (LLM names what's missing and searches again) |
+| What the LLM reads | `agent.context` | `chunk` · `window` (+ neighbours) · `section` (retrieve less, read more) |
+| Compression | `agent.compression` | `none` · `sentences` (extractive, reranker-scored) |
+| Answer format | `agent.answer_mode` | `grounded` · `grounded_evidence` · `freetext` |
+| Claim verifier | `agent.verifier` | `reranker` · `nli` · `none` |
+| Adapters | `llm.adapters.{answer,decompose}` | path to a trained `.gguf` LoRA, or unset |
+
+Booleans switch optional stages on or off: `agent.route`, `agent.decompose`, `agent.crag`,
+`agent.self_correct`, `ingest.contextualize`, plus `ingest.child_size` (parent-child) and
+`agent.min_relevance` (refusal gate).
+
 ### What is hand-written (and why)
 
 | Component | What it does | Why it matters for small models |
@@ -34,7 +56,8 @@ answer ◄── self-correction ◄── claim verification ◄── grounded
 | `ingest/parser.py` | Font-statistics heading hierarchy, column-aware reading order, running header/footer removal, de-hyphenation | Clean, well-scoped chunks; two-column regulations aren't interleaved |
 | `ingest/chunker.py` | Chunks never cross section/page boundaries, carry their heading path; tables kept whole (split by rows with repeated header); parent-child children; content-hash IDs | Section context in every embedding; idempotent re-ingestion |
 | `retrieval/bm25.py` | Okapi BM25 with an inverted index; tokenizer keeps identifiers like `820.30` | Exact regulatory references are where dense retrieval fails |
-| `retrieval/index.py` | SPLADE inverted index over learned term weights | Learned sparse retrieval without a search engine |
+| `retrieval/index.py` | SPLADE inverted index over learned term weights; section/window context expansion | Learned sparse retrieval without a search engine |
+| `retrieval/colbert.py` | ColBERT token encoder (reproducing the model's PyLate config) and exact MaxSim search | Late interaction without extra dependencies |
 | `retrieval/fusion.py` | Weighted Reciprocal Rank Fusion over (query × retriever) rankings | No score calibration needed; the original query outweighs sub-queries |
 | `agents.py` | Router, decomposer, CRAG query rewriter, grounded answerer. All structured outputs are JSON-Schema → llama.cpp grammar; citations are an `enum` of the passage numbers shown | A 0.8B model *cannot* emit malformed JSON or cite a non-existent source |
 | `agents.verify_claims` | Scores each claim against its cited passages (and, for multi-citation claims, against them combined) with an NLI model | Unsupported claims are dropped before the user sees them |
@@ -54,6 +77,7 @@ actually support, plus correct refusals of unanswerable questions.
 
 ```bash
 python -m localrag train dpo              # sample answers, rank by reward, train on best-vs-worst pairs
+python -m localrag train dpo-refusal      # + refusal and mirrored anti-refusal pairs (learns when NOT to answer)
 python -m localrag train grpo             # online RL (GRPO, Dr. GRPO loss) with the same reward
 python -m localrag train grpo-decompose   # RL for query decomposition; reward = recall of gold pages
 ```
@@ -65,6 +89,15 @@ use different adapters on the same base model:
 ```bash
 python -m localrag --set llm.adapters.answer=adapters/grpo.gguf ask "..."
 ```
+
+**Teaching refusal.** `dpo-refusal` adds pairs where refusing (`{"claims": []}`) is the chosen
+answer: unanswerable train questions, plus *counterfactuals*, which are answerable questions with the
+gold pages removed from the passages, kept only if NLI confirms the rest can't answer them. A first
+version trained on these alone **collapsed to refusing everything** (100% false refusals): the
+refusal string was only ever *chosen*, so making it likely everywhere satisfied every preference.
+The fix is mirrored **anti-refusal pairs**: the same questions *with* their evidence, where the
+refusal is *rejected* (70 of 100 are exact minimal pairs), plus a small SFT term on chosen answers
+(RPO-style). The model then has to read the passages to decide.
 
 In `demo.ipynb` this is a parameter (`ANSWER_ADAPTER = "grpo"`), and a cell compares base vs.
 DPO vs. GRPO answers side by side. Nothing requires training: without adapters everything runs
@@ -113,8 +146,9 @@ from a different model family (Gemma 4 12B), so the judge isn't grading text in 
 - **Two-phase runner:** answers for all variants are generated first (only small models on the GPU),
   then the judge grades everything in one pass; grades are cached in the result files.
 
-Full table (24 variants): `eval/results/summary.md`. The first iteration (simpler,
-single-hop-only set) is archived in `eval/results_v1/`.
+Full table (32 variants): `eval/results/summary.md`. Superseded runs are kept in
+`eval/results_extra/` (the collapsed refusal adapter, iterative retrieval before a loop fix), and
+the first iteration on a simpler single-hop set is in `eval/results_v1/`.
 
 ## Results
 
@@ -130,7 +164,10 @@ judge finds supported by the passages they cite.
 | NLI verifier | 0.74 ±.06 | 0.48 | 0.96 ±.02 | 0.89 | 41% | 5% |
 | **NLI verifier + DPO adapter** | **0.91 ±.04** | 0.64 | **0.98 ±.01** | **0.94** | 0% | 0% |
 | NLI verifier + GRPO adapter | 0.82 ±.06 | 0.43 | 0.98 ±.02 | 0.89 | 12% | 4% |
+| **NLI verifier + DPO-refusal adapter** | 0.83 ±.05 | 0.54 | 0.94 ±.02 | 0.90 | **100%** | 8% |
+| DPO-refusal v1 (no anti-refusal pairs): collapsed | – | – | – | 0.00 | 100% | **100%** |
 | relevance gate (threshold from train+dev) | 0.64 ±.08 | 0.52 | 0.93 ±.03 | 0.78 | 94% | 21% |
+| DPO adapter + relevance gate | 0.75 ±.07 | 0.55 | 0.97 ±.02 | 0.79 | 94% | 21% |
 
 ### What the ablations show
 
@@ -144,21 +181,35 @@ judge finds supported by the passages they cite.
   (5.9 per answer, 95% verifier-accepted). GRPO learned to say *less* (3.1 claims per answer):
   equally faithful, but it lost multi-hop completeness (0.43). With online RL the cheapest path
   through the reward was to be terse, even with a coverage term; a higher coverage weight is the obvious next experiment.
-- **Refusal is a dial, not a solved problem.** Neither adapter learned to refuse: the sampled
-  training data contained no refusals, so there was nothing to reinforce. The relevance gate catches
-  94% of unanswerable questions but wrongly refuses 21% of answerable ones. Recommended next step:
-  add refusal pairs for unanswerable train questions.
+- **Refusal can be learned, and it beats a threshold.** The DPO and GRPO adapters never refused:
+  their training samples contained no refusals. The score-threshold gate catches 94% of unanswerable
+  questions but wrongly refuses 21% of answerable ones, because it sees one retrieval score, not the
+  evidence. The DPO-refusal adapter refuses **all 17** unanswerable test questions at **8%** false
+  refusals, and still beats the untuned pipeline on correctness (0.83 vs 0.74–0.78). Stacking the gate
+  on top only adds false refusals. Remaining weakness: comparison questions (30% false refusals). When
+  one side of a comparison is missing, the model refuses instead of answering the side it has; partial-evidence
+  pairs are the next fix. 17/17 has a wide CI (true rate plausibly ≥ ~80%).
 - **Retrieval.** The cross-encoder reranker matters most: without it, multi-hop All@5 drops from 0.49 to 0.30.
   BM25 vs SPLADE, contextual retrieval, parent-child, Qwen3-Embedding and Docling are all within
   the confidence intervals on this corpus (contextual / parent-child / Qwen3-Embedding trend up on
   multi-hop: 0.53–0.55 vs 0.49).
+- **Newer retrieval and reading strategies didn't beat the default on this corpus:** late interaction
+  (ColBERT: 0.76 correct), whole sections ("retrieve less, read more": 0.77), extractive compression
+  (0.75), all within the CI of the default (0.78). Adjacent-chunk windows *lowered* faithfulness
+  (0.90 → 0.84): with more text per passage, the 0.8B model more often blends details. More context
+  is not free for a small reader. Iterative retrieval also showed no gain (0.77 correct,
+  multi-hop All@5 0.47, +50% latency): the 0.8B model almost never judges its evidence complete
+  (2 hops on 119 of 168 questions), so a trained search policy (Search-R1-style RL) is the next step.
 - **No measurable gain:** CRAG (fired on 19% of questions), self-correction, evidence-first
   prompting, query decomposition, and the RL-trained decomposer. These are reported as-is.
 - **The generator matters in the grounded pipeline:** Qwen3.5-0.8B scores 0.78 correct vs 0.65 for Qwen3-0.6B.
 
-**Recommended configuration:** `--set agent.verifier=nli --set agent.support_threshold=0.5
---set llm.adapters.answer=adapters/dpo.gguf` (train it with `python -m localrag train dpo`),
-plus the relevance gate where refusing unanswerable questions matters more than coverage.
+**Recommended configurations** (both use `--set agent.verifier=nli --set agent.support_threshold=0.5`):
+
+- **Open-ended users → `llm.adapters.answer=adapters/dpo-refusal.gguf`** (`train dpo-refusal`).
+  Refuses what the documents don't cover, 0.83 correct, 0.94 faithful.
+- **Questions known to be in scope → `llm.adapters.answer=adapters/dpo.gguf`** (`train dpo`).
+  0.91 correct, 0.98 faithful, but it will attempt every question.
 
 ### Limitations
 
@@ -170,3 +221,7 @@ plus the relevance gate where refusing unanswerable questions matters more than 
   matter on larger corpora.
 - Variants generated after a robustness fix use a 1,200-token answer budget instead of 700. Only
   evidence-first answers approach that limit.
+- The verifier checks that a cited passage supports a claim's *content*, not that the claim names
+  the right *source document*. A claim can say "the OTS guidance requires X" while correctly citing
+  a cybersecurity-guidance passage that says X.
+- Each adapter comes from a single training run (no seeds averaged).

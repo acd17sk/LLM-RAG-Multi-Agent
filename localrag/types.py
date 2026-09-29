@@ -23,6 +23,11 @@ class Chunk:
     section: str = ""         # heading path, e.g. "Subpart C > 820.30 Design controls"
     context: str = ""         # optional LLM-written situating context (contextual retrieval)
     parent_id: str = ""       # set on child chunks (parent-child retrieval)
+    page_end: int = 0         # last page, when a passage spans pages (expanded context)
+
+    @property
+    def pages(self) -> set[tuple[str, int]]:
+        return {(self.source, p) for p in range(self.page, max(self.page, self.page_end) + 1)}
 
     @property
     def index_text(self) -> str:
@@ -70,6 +75,8 @@ class Answer:
         used = sorted({i for c in claims for i in c.citations})
         refs = "\n".join(
             f"[{i}] {self.passages[i - 1].chunk.source}, p. {self.passages[i - 1].chunk.page}"
+            + (f"–{self.passages[i - 1].chunk.page_end}"
+               if self.passages[i - 1].chunk.page_end > self.passages[i - 1].chunk.page else "")
             + (f" — {self.passages[i - 1].chunk.section}" if self.passages[i - 1].chunk.section else "")
             for i in used)
         return f"{body}\n\n{refs}" if refs else body

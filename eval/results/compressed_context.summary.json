@@ -1,0 +1,65 @@
+{
+ "n": 168,
+ "n_single": 104,
+ "n_multi": 47,
+ "n_unanswerable": 17,
+ "R@5": {
+  "mean": 0.942,
+  "ci": 0.043,
+  "n": 104
+ },
+ "MRR": {
+  "mean": 0.874,
+  "ci": null,
+  "n": 104
+ },
+ "multi_All@5": {
+  "mean": 0.489,
+  "ci": 0.149,
+  "n": 47
+ },
+ "multi_All@10": {
+  "mean": 0.681,
+  "ci": null,
+  "n": 47
+ },
+ "correct": {
+  "mean": 0.745,
+  "ci": 0.053,
+  "n": 104
+ },
+ "multi_correct": {
+  "mean": 0.606,
+  "ci": 0.096,
+  "n": 47
+ },
+ "faithful": {
+  "mean": 0.9,
+  "ci": 0.031,
+  "n": 166
+ },
+ "cited": {
+  "mean": 1.0,
+  "ci": null,
+  "n": 166
+ },
+ "cites_gold": {
+  "mean": 0.923,
+  "ci": null,
+  "n": 104
+ },
+ "multi_cites_all": {
+  "mean": 0.404,
+  "ci": null,
+  "n": 47
+ },
+ "false_refusal": {
+  "mean": 0.007
+ },
+ "unans_refusal": {
+  "mean": 0.059
+ },
+ "latency_s": {
+  "mean": 0.96
+ }
+}

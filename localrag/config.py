@@ -46,6 +46,9 @@ class RetrievalConfig(_Strict):
     mode: Literal["dense", "sparse", "hybrid"] = "hybrid"
     sparse: Literal["bm25", "splade"] = "bm25"
     splade_model: str = "prithivida/Splade_PP_en_v1"
+    # dense stage: one vector per chunk (bi_encoder) or one per token with MaxSim (late_interaction)
+    dense_backend: Literal["bi_encoder", "late_interaction"] = "bi_encoder"
+    colbert_model: str = "lightonai/GTE-ModernColBERT-v1"
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     query_prompt: Optional[str] = None   # e.g. "query" for Qwen3-Embedding
     # cross_encoder: sentence-transformers model id; llama: GGUF reranker served by llama-server
@@ -70,6 +73,19 @@ class AgentConfig(_Strict):
     decompose: bool = True        # multi-query decomposition
     max_subqueries: int = 3
     answer_mode: Literal["grounded", "grounded_evidence", "freetext"] = "grounded"
+    # single: one retrieval round. iterative: after retrieving, the LLM names what is still missing
+    # and issues a follow-up search (up to max_hops), IRCoT / Self-Ask style
+    retrieval_strategy: Literal["single", "iterative"] = "single"
+    max_hops: int = 2
+    # what the LLM reads per retrieved hit: the chunk, the chunk plus neighbours, or its whole
+    # section ("retrieve less, read more"), capped at context_chars per passage
+    context: Literal["chunk", "window", "section"] = "chunk"
+    context_window: int = 1
+    context_chars: int = 4000
+    # extractive compression: keep only the compress_sentences most query-relevant sentences per
+    # passage (scored by the reranker), in document order
+    compression: Literal["none", "sentences"] = "none"
+    compress_sentences: int = 4
     # Corrective RAG: if the best reranker score is below crag_threshold, rewrite the query and
     # retrieve again (up to crag_retries times) before generating.
     crag: bool = False
@@ -122,6 +138,9 @@ class RLConfig(_Strict):
     dpo_samples: int = 6
     dpo_min_margin: float = 0.5
     dpo_beta: float = 0.1
+    # refusal training: weight of an SFT (NLL) term on chosen answers added to the DPO loss (RPO);
+    # keeps the answering ability anchored while the refusal preference is learned
+    refusal_sft_weight: float = 0.2
     # GRPO
     num_generations: int = 6
     grpo_prompts_per_step: int = 4              # one optimizer step = this many prompts x num_generations

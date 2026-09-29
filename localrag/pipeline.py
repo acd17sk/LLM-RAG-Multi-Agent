@@ -86,6 +86,45 @@ class RAGPipeline:
         agents.verify_claims(claims, hits, self.verifier, self.cfg.agent.support_threshold)
         return sum(bool(c.supported) for c in claims) / len(claims)
 
+    def _iterate(self, query: str, hits: list[Hit], subqueries: list[str], trace: dict) -> list[Hit]:
+        """Up to max_hops follow-up searches for whatever the passages don't cover yet. The best new
+        hit of each hop is pinned into the final set, so second-hop evidence (which can rank low
+        against the original question) is not reranked away."""
+        a, k = self.cfg.agent, self.cfg.retrieval.top_k
+        pinned: list[Hit] = []
+        for _ in range(a.max_hops):
+            follow_up = agents.next_search(self.llm, query, hits)
+            asked = {q.strip().lower() for q in trace.get("hops", [])}
+            if follow_up is None or follow_up.strip().lower() in asked:
+                break   # nothing missing, or the model is repeating itself
+            trace.setdefault("hops", []).append(follow_up)
+            subqueries.append(follow_up)
+            seen = {h.chunk.id for h in hits}
+            new = [h for h in self.retriever.retrieve(follow_up) if h.chunk.id not in seen]
+            if not new:
+                break
+            pinned.append(new[0])
+            merged = self.retriever.rerank(query, [Hit(h.chunk, 0.0, {}) for h in hits + new],
+                                           limit=len(hits) + len(new))
+            keep = [h for h in merged if h.chunk.id not in {p.chunk.id for p in pinned}][:k - len(pinned)]
+            hits = keep + [next(m for m in merged if m.chunk.id == p.chunk.id) for p in pinned]
+        return hits
+
+    def _expand(self, hits: list[Hit]) -> list[Hit]:
+        """Replace each hit by its window / section; hits that land in an already-included span merge."""
+        a = self.cfg.agent
+        out, covered = [], set()
+        for h in hits:
+            if h.chunk.id in covered:
+                continue
+            big = self.index.expand(h.chunk, a.context, a.context_window, a.context_chars)
+            span = {cid for cid, c in self.index.chunks.items()
+                    if c.source == big.source and c.section == big.section and big.page <= c.page <= max(big.page, big.page_end)
+                    and c.text in big.text}
+            covered |= span
+            out.append(Hit(big, h.score, h.scores))
+        return out
+
     def answer(self, query: str) -> Answer:
         a = self.cfg.agent
         timings: dict[str, float] = {}
@@ -125,14 +164,30 @@ class RAGPipeline:
                     hits = self.retriever.retrieve(query, [rewritten], extra=hits)
                 trace.setdefault("crag_rewrites", []).append(rewritten)
 
+        # Iterative retrieval: the LLM names what is still missing and searches for it
+        if a.retrieval_strategy == "iterative":
+            with timed("iterate"):
+                hits = self._iterate(query, hits, subqueries, trace)
+
         # Retrieval gate: even the best passage looks irrelevant -> refuse rather than improvise
         top = self._top(hits)
         if not hits or (top is not None and top < a.min_relevance):
             return Answer(query, action, REFUSAL, [], hits, subqueries, True, timings, trace)
 
+        # What the LLM reads: expanded context (verification and citations use the same passages),
+        # optionally compressed for the prompt only
+        if a.context != "chunk":
+            hits = self._expand(hits)
+        shown = hits
+        if a.compression == "sentences" and self.retriever.reranker is not None:
+            with timed("compress"):
+                shown = agents.compress(hits, query, self.retriever.reranker, a.compress_sentences)
+            trace["compression"] = round(sum(len(h.chunk.text) for h in shown) /
+                                         max(1, sum(len(h.chunk.text) for h in hits)), 3)
+
         with timed("generate"):
             try:
-                text, claims = self._generate(query, hits)
+                text, claims = self._generate(query, shown)
             except LLMOutputError as e:
                 # one malformed generation must not take the whole request down: treat as "no claims"
                 text, claims = "", []
@@ -144,7 +199,7 @@ class RAGPipeline:
         # Self-correction: regenerate once with the unsupported claims as feedback; keep the better answer
         if a.self_correct and grounded and claims and support < a.self_correct_below:
             with timed("self_correct"):
-                _, retry = self._generate(query, hits, agents.self_correction_feedback(claims))
+                _, retry = self._generate(query, shown, agents.self_correction_feedback(claims))
                 retry_support = self._verify(retry, hits)
             trace["self_correct"] = {"before": round(support, 3), "after": round(retry_support, 3)}
             if sum(bool(c.supported) for c in retry) > sum(bool(c.supported) for c in claims):

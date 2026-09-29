@@ -7,3 +7,4 @@ __pycache__/
 adapters/
 eval/results_v1/*.jsonl
 !eval/results_v1/dataset_v1.jsonl
+eval/results_extra/*.jsonl

@@ -45,7 +45,7 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("calibrate", help="pick agent.min_relevance on the train+dev splits")
 
     tr = sub.add_parser("train", help="optional: DPO / GRPO fine-tuning of the generator (LoRA)")
-    tr.add_argument("method", choices=["dpo", "grpo", "grpo-decompose"])
+    tr.add_argument("method", choices=["dpo", "dpo-refusal", "grpo", "grpo-decompose"])
     tr.add_argument("--limit", type=int, help="use only the first N train questions")
 
     args = p.parse_args(argv)

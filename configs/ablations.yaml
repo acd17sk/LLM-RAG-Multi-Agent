@@ -68,3 +68,25 @@ variants:
     overrides: {llm.adapters: {answer: adapters/grpo.gguf}, agent.verifier: nli, agent.support_threshold: 0.5}
   - name: grpo_decompose
     overrides: {llm.adapters: {decompose: adapters/grpo-decompose.gguf}}
+
+  # ---------- refusal: DPO with refusal pairs, and combinations with the relevance gate
+  - name: dpo_gate
+    overrides: {llm.adapters: {answer: adapters/dpo.gguf}, agent.verifier: nli, agent.support_threshold: 0.5,
+                agent.min_relevance: 0.95}
+  - name: dpo_refusal
+    overrides: {llm.adapters: {answer: adapters/dpo-refusal.gguf}, agent.verifier: nli, agent.support_threshold: 0.5}
+  - name: dpo_refusal_gate
+    overrides: {llm.adapters: {answer: adapters/dpo-refusal.gguf}, agent.verifier: nli, agent.support_threshold: 0.5,
+                agent.min_relevance: 0.95}
+
+  # ---------- retrieval / reading strategies (string parameters)
+  - name: late_interaction           # ColBERT MaxSim instead of the bi-encoder in the dense stage
+    overrides: {retrieval.dense_backend: late_interaction}
+  - name: iterative_retrieval        # LLM names what is missing and searches again (up to 2 hops)
+    overrides: {agent.retrieval_strategy: iterative}
+  - name: context_window             # each hit plus its neighbouring chunks in the same section
+    overrides: {agent.context: window}
+  - name: read_more_sections         # retrieve less, read more: top-3 hits expanded to whole sections
+    overrides: {agent.context: section, retrieval.top_k: 3}
+  - name: compressed_context         # keep the 4 most query-relevant sentences per passage
+    overrides: {agent.compression: sentences}
