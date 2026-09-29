@@ -1,10 +1,17 @@
-index/
-logs/
-eval/results/*.jsonl
+# editor / OS / local assistant files
+.DS_Store
+.vscode/
+CLAUDE.md
+
+# Python
 __pycache__/
 .ipynb_checkpoints/
-.DS_Store
+
+# generated artifacts (rebuild with: localrag ingest / train / eval)
+index/
+logs/
 adapters/
+eval/results/*.jsonl
+eval/results_extra/*.jsonl
 eval/results_v1/*.jsonl
 !eval/results_v1/dataset_v1.jsonl
-eval/results_extra/*.jsonl

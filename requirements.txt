@@ -1,11 +1,24 @@
 # llama-server (the inference backend) comes from conda-forge, not pip:
 #   conda install -c conda-forge "llama.cpp=*=cuda130*"     (or the cpu build)
+# Install torch first for your CUDA version, e.g.:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu130
+
+# --- core pipeline
 pymupdf
+docling
 chromadb
 sentence-transformers
 huggingface-hub
 pydantic>=2
 pyyaml
 requests
+
+# --- fine-tuning (python -m localrag train ...)
+trl
+peft
+datasets
+flash-linear-attention      # fast kernels for Qwen3.5's linear-attention layers
+# causal-conv1d             # optional, compiled: CUDA_HOME=... pip install causal-conv1d --no-build-isolation
+
+# --- tests
 pytest
-docling

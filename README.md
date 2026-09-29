@@ -24,7 +24,7 @@ All 32 variants, with 95% confidence intervals: [`eval/results/summary.md`](eval
 conda create -n rag -c conda-forge python=3.12 "llama.cpp=*=cuda130*"
 conda activate rag
 pip install torch --index-url https://download.pytorch.org/whl/cu130
-pip install -r requirements.txt            # + requirements-rl.txt for training
+pip install -r requirements.txt
 
 python -m localrag ingest                  # index documents/*.pdf
 python -m localrag ask "What must design verification confirm?" --trace

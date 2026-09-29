@@ -1,6 +1,0 @@
-# Optional: preference / RL fine-tuning (python -m localrag train ...)
-trl
-peft
-datasets
-flash-linear-attention      # fast kernels for Qwen3.5's linear-attention layers
-# causal-conv1d             # optional, compiled: CUDA_HOME=... pip install causal-conv1d --no-build-isolation
