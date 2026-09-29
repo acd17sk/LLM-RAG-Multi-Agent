@@ -1,0 +1,1 @@
+{"R@1": 0.838, "R@3": 0.938, "R@5": 0.963, "R@10": 0.988, "MRR": 0.89, "nDCG@10": 0.914, "correct": 0.881, "faithful": 0.122, "cited": 0.151, "cites_gold": 0.263, "false_refusal": 0.0, "unans_refusal": 0.0, "latency_s": 1.07}

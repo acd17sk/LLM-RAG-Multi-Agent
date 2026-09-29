@@ -1,116 +1,172 @@
-# Simple RAG Pipeline for Document Q&A
+# localrag: accurate RAG with sub-1B local models
 
-This project implements a simple **Retrieval-Augmented Generation (RAG)** pipeline designed for querying a local collection of PDF documents. It leverages local language models and embedding models to ensure privacy and control. The system is built with a sophisticated, multi-step agentic workflow that includes query decomposition and reranking to provide accurate, cited answers.
+A fully local question-answering system over PDF documents, built to show how far a
+**0.6–0.8B parameter model** can go when the retrieval, generation and training around it are
+engineered carefully. It runs on a single consumer GPU (developed on an RTX 5070 Ti, 16 GB),
+sends no data to external services, and every design choice is measured by a leave-one-out
+ablation on a held-out evaluation set.
 
----
+The demo corpus is public US FDA medical-device regulation (21 CFR 820, software
+validation, off-the-shelf software, cybersecurity, and AI/ML SaMD guidance).
 
-## 🚀 Features
+## Pipeline
 
-- 📄 **Structured PDF Parsing**: Intelligently extracts text by identifying headers and paragraphs to maintain document context.  
-- 🧠 **Agentic Workflow**:
-  - **Orchestrator Agent**: Analyzes the user's query to decide whether to search the knowledge base or attempt a direct answer.  
-  - **Query Decomposition Agent**: Breaks down complex user questions into multiple, targeted sub-queries for more comprehensive retrieval.  
-- 🔍 **Multi-Query Retrieval**: Fetches relevant document chunks from a ChromaDB vector store for each sub-query.  
-- ✨ **Cross-Encoder Reranking**: Refines the retrieved results by reranking them against the original query for maximum relevance, ensuring the best documents are used as context.  
-- 🤖 **100% Local Inference**: Uses GGUF models via llama-cpp-python for all language generation tasks, ensuring data privacy and offline capability.  
-- 📝 **Cited Responses**: The final answer is synthesized from the retrieved context, with each piece of information followed by a citation  
-  *Example: [Source: document.pdf, Page X]*  
-
----
-
-## 📂 Project Structure
-
-The codebase is organized into logical modules for clarity and maintainability.
 ```
-Directory of the Project/
-├── 📁 documents/ # PDF files here
-├── 📁 rag_agents/ # Contains the logic for the RAG pipeline agents
-├── 📁 data_processing/ # Modules for PDF parsing and text chunking
-├── 📁 llm/ # Wrapper for the local Llama.cpp model
-├── 📁 vector_store/ # Functions for managing and querying ChromaDB
-├── 📄 demo.ipynb # Jupyter Notebook for running the end-to-end demo
-├── 📄 requirements.txt # Project dependencies
-└── 📄 README.md # This file
+PDFs ─► parser ─────────► section-aware chunker ─► [child chunks] ─► BM25 | SPLADE   ─┐
+        hand-written       heading paths, tables     parent-child      dense (Chroma) ─┤
+        or Docling         kept whole, hash IDs      "small-to-big"    [+ LLM context] │
+                                                                                      ▼
+question ─► router ─► decomposer ─► per-query sparse + dense ─► weighted RRF ─► rerank
+            (grammar-   (grammar-                                              (cross-encoder or
+             constrained) constrained, optional RL adapter)                    Qwen3-Reranker)
+                                                                                      │
+                   ┌── CRAG: weak evidence → rewrite query → retrieve again ◄─────────┤
+                   │   relevance gate: still weak → refuse                            ▼
+answer ◄── self-correction ◄── claim verification ◄── grounded generation (claims + citation IDs,
+           (regenerate once       (NLI entailment or      grammar-constrained; optional
+            with feedback)         reranker, per claim)    DPO/GRPO adapter)
 ```
----
 
-## 🛠️ Setup and Installation
+### What is hand-written (and why)
 
-Follow these steps to get the project running on your local machine.
+| Component | What it does | Why it matters for small models |
+|---|---|---|
+| `ingest/parser.py` | Font-statistics heading hierarchy, column-aware reading order, running header/footer removal, de-hyphenation | Clean, well-scoped chunks; two-column regulations aren't interleaved |
+| `ingest/chunker.py` | Chunks never cross section/page boundaries, carry their heading path; tables kept whole (split by rows with repeated header); parent-child children; content-hash IDs | Section context in every embedding; idempotent re-ingestion |
+| `retrieval/bm25.py` | Okapi BM25 with an inverted index; tokenizer keeps identifiers like `820.30` | Exact regulatory references are where dense retrieval fails |
+| `retrieval/index.py` | SPLADE inverted index over learned term weights | Learned sparse retrieval without a search engine |
+| `retrieval/fusion.py` | Weighted Reciprocal Rank Fusion over (query × retriever) rankings | No score calibration needed; the original query outweighs sub-queries |
+| `agents.py` | Router, decomposer, CRAG query rewriter, grounded answerer. All structured outputs are JSON-Schema → llama.cpp grammar; citations are an `enum` of the passage numbers shown | A 0.8B model *cannot* emit malformed JSON or cite a non-existent source |
+| `agents.verify_claims` | Scores each claim against its cited passages (and, for multi-citation claims, against them combined) with an NLI model | Unsupported claims are dropped before the user sees them |
+| `rl/rewards.py` | Verifiable reward: format, NLI-entailed citations, gold-page citation, refusal calibration, length | Rewards that can't be gamed without actually being faithful |
+| `eval/` | Synthetic single- and multi-hop QA, page-level retrieval metrics, cross-family LLM judge, bootstrap CIs, dev-calibrated thresholds, two-phase runner | Every technique has to earn its place in the numbers |
 
-### 1. Install Dependencies
+Libraries are used for commodity parts only: llama.cpp (`llama-server`) for inference,
+sentence-transformers for embedding / reranking / NLI models, ChromaDB for vectors,
+PyMuPDF and Docling for reading PDFs, TRL + PEFT for training.
+
+## Optional: RL / preference fine-tuning
+
+The generator can be improved with LoRA adapters trained on the **train split** using a
+verifiable reward (`localrag/rl/rewards.py`). The claim-level reward uses the same NLI
+entailment check as the verifier, so the model is paid only for claims its cited passages
+actually support, plus correct refusals of unanswerable questions.
+
 ```bash
-pip install -r requirements.txt
+python -m localrag train dpo              # sample answers, rank by reward, train on best-vs-worst pairs
+python -m localrag train grpo             # online RL (GRPO, Dr. GRPO loss) with the same reward
+python -m localrag train grpo-decompose   # RL for query decomposition; reward = recall of gold pages
 ```
-### 2. Place Your Documents
-Add all the PDF files you want to query into the `documents/` folder.
 
-### 3. Configure the Project
-Open the demo.ipynb and review the settings. The defaults are chosen for a good balance of performance and resource usage, but you can customize them:
+Each command writes `adapters/<name>/` (PEFT) and `adapters/<name>.gguf`. llama-server loads
+all configured adapters once and enables one per request, so different pipeline steps can
+use different adapters on the same base model:
 
-pdf_folder: Path to your documents folder.
+```bash
+python -m localrag --set llm.adapters.answer=adapters/grpo.gguf ask "..."
+```
 
-CHROMA_PATH & COLLECTION_NAME: Settings for the vector database.
+In `demo.ipynb` this is a parameter (`ANSWER_ADAPTER = "grpo"`), and a cell compares base vs.
+DPO vs. GRPO answers side by side. Nothing requires training: without adapters everything runs
+on the base model.
 
-EMBEDDING_MODEL & RERANKER_MODEL: The HuggingFace repo IDs for the Bi-Encoder and the CrossEncoder respectively.
+## Setup
 
-LLM_MODEL_ID & LLM_MODEL_FILE: The HuggingFace repo ID and filename for the GGUF model you wish to use.
+```bash
+conda create -n rag -c conda-forge python=3.12 "llama.cpp=*=cuda130*"   # or the cpu build
+conda activate rag
+pip install torch --index-url https://download.pytorch.org/whl/cu130   # match your CUDA
+pip install -r requirements.txt
+pip install -r requirements-rl.txt                                       # optional: training
+```
 
-The first time you run the code, the model will be automatically downloaded and cached by the huggingface_hub library.
+Models are downloaded from the Hugging Face Hub on first use.
 
-## 🚀 How to Run the Demo
-The entire workflow is demonstrated in the demo.ipynb Jupyter Notebook.
+## Usage
 
-### Step 1: Launch Jupyter
+```bash
+python -m localrag ingest                         # parse, chunk and index documents/*.pdf
+python -m localrag ask "What must design verification confirm?" --trace
+python -m localrag eval-gen                       # build eval/dataset.jsonl with the teacher model
+python -m localrag calibrate                      # pick the refusal threshold on the dev split
+python -m localrag eval                           # all variants in configs/ablations.yaml, test split
+python -m localrag eval --only default crag --limit 20
+python -m pytest tests
+```
 
-Make sure your virtual environment is activated, then start Jupyter:
+All settings live in `configs/default.yaml` and can be overridden per command, e.g.
+`python -m localrag --set retrieval.sparse=splade --set agent.crag=true ask "..."`.
 
-### Step 2: Build the Vector Database
-Open demo.ipynb and run the cells in `Document Processing and DB populating`
+## Evaluation
 
-This will:
-- Parse all PDFs from your documents/ folder.
+`eval/dataset.jsonl` is written by a 9B **teacher** (Qwen3.5-9B) and graded by a 12B **judge**
+from a different model family (Gemma 4 12B), so the judge isn't grading text in its own style.
 
-- Chunk the text contextually.
+- **Question types:** single-hop (direct / paraphrased / practical), multi-hop *comparison*
+  (two documents) and *bridge* (two sections), and unanswerable questions. Unanswerable
+  labels are double-checked against retrieval by the model, and noisy ones dropped.
+- **Splits:** train (50%) / dev (15%) / test (35%), assigned by **source page**, so no gold page is
+  shared between training and test. Thresholds are calibrated on dev, results reported on test.
+- **Metrics:** R@5 (single-hop), All@5 (all gold pages retrieved, multi-hop), judge correctness,
+  judge faithfulness of cited claims, citation rate, gold-page citation, false/correct refusal rates,
+  latency. `±` is a 95% bootstrap confidence interval.
+- **Two-phase runner:** answers for all variants are generated first (only small models on the GPU),
+  then the judge grades everything in one pass; grades are cached in the result files.
 
-- Generate embeddings using the sentence-transformer model.
+Full table (24 variants): `eval/results/summary.md`. The first iteration (simpler,
+single-hop-only set) is archived in `eval/results_v1/`.
 
-- Store everything in a local ChromaDB database.
+## Results
 
-Note: You only need to run this step once, unless you add, remove, or change the PDF documents.
+Test split: 104 single-hop, 47 multi-hop, 17 unanswerable questions; ± is the 95% bootstrap CI.
+*correct* = judge agreement with the reference answer; *faithful* = share of answer claims the
+judge finds supported by the passages they cite.
 
-### Step 3: Ask Questions!
-Proceed to `Retrieve information based on User Queries`.
+| variant | correct | multi-hop correct | faithful | cites gold page | refuses unanswerable | false refusals |
+|---|---|---|---|---|---|---|
+| v0: original design (dense, prompt-only citations, Qwen3-0.6B) | 0.81 ±.07 | 0.59 | 0.12 ±.04 | 0.22 | 0% | 0% |
+| free-text answers, current retrieval | 0.86 ±.06 | 0.71 | 0.04 ±.03 | 0.06 | 0% | 0% |
+| **default** (hybrid + rerank, grounded claims, reranker verifier) | 0.78 ±.06 | 0.62 | 0.90 ±.03 | 0.92 | 6% | 0% |
+| NLI verifier | 0.74 ±.06 | 0.48 | 0.96 ±.02 | 0.89 | 41% | 5% |
+| **NLI verifier + DPO adapter** | **0.91 ±.04** | 0.64 | **0.98 ±.01** | **0.94** | 0% | 0% |
+| NLI verifier + GRPO adapter | 0.82 ±.06 | 0.43 | 0.98 ±.02 | 0.89 | 12% | 4% |
+| relevance gate (threshold from train+dev) | 0.64 ±.08 | 0.52 | 0.93 ±.03 | 0.78 | 94% | 21% |
 
-- Locate the get_rag_response() function call.
+### What the ablations show
 
-- Change the user_query variable to your question or add another block by copy pasting the existing code.
+- **Grounding is the core win.** Prompt-only citations are almost never faithful (4–12% of claims),
+  whatever the model. Schema-enforced citations plus verification bring this to 90–98%.
+- **Preference tuning removed the faithfulness/correctness trade-off.** Grounded answers were
+  less complete than free text (0.78 vs 0.86 correct). The DPO adapter, trained on the train split
+  with the verifiable reward (support + gold citation + coverage), reaches **0.91 correct with 0.98
+  faithful**: better than free text on correctness, while nearly every claim is backed by its citation.
+- **DPO and GRPO optimized the same reward differently.** DPO writes more claims, more carefully
+  (5.9 per answer, 95% verifier-accepted). GRPO learned to say *less* (3.1 claims per answer):
+  equally faithful, but it lost multi-hop completeness (0.43). With online RL the cheapest path
+  through the reward was to be terse, even with a coverage term; a higher coverage weight is the obvious next experiment.
+- **Refusal is a dial, not a solved problem.** Neither adapter learned to refuse: the sampled
+  training data contained no refusals, so there was nothing to reinforce. The relevance gate catches
+  94% of unanswerable questions but wrongly refuses 21% of answerable ones. Recommended next step:
+  add refusal pairs for unanswerable train questions.
+- **Retrieval.** The cross-encoder reranker matters most: without it, multi-hop All@5 drops from 0.49 to 0.30.
+  BM25 vs SPLADE, contextual retrieval, parent-child, Qwen3-Embedding and Docling are all within
+  the confidence intervals on this corpus (contextual / parent-child / Qwen3-Embedding trend up on
+  multi-hop: 0.53–0.55 vs 0.49).
+- **No measurable gain:** CRAG (fired on 19% of questions), self-correction, evidence-first
+  prompting, query decomposition, and the RL-trained decomposer. These are reported as-is.
+- **The generator matters in the grounded pipeline:** Qwen3.5-0.8B scores 0.78 correct vs 0.65 for Qwen3-0.6B.
 
-- Run the cell to get a complete, cited answer.
+**Recommended configuration:** `--set agent.verifier=nli --set agent.support_threshold=0.5
+--set llm.adapters.answer=adapters/dpo.gguf` (train it with `python -m localrag train dpo`),
+plus the relevance gate where refusing unanswerable questions matters more than coverage.
 
-## ⚙️ The RAG Pipeline Explained
+### Limitations
 
-When you ask a question, the system follows this step-by-step process:
-
-### 1. Orchestration
-- The `run_orchestrator_agent` analyzes your query.  
-- If it's simple chit-chat, it may answer directly.  
-- If it's knowledge-based, it triggers the **SEARCH** action.  
-
-### 2. Query Decomposition
-- For complex questions (e.g., comparisons), the `run_query_decomposition_agent` breaks it into smaller, focused sub-queries.  
-- **Example:**  
-  - *"Compare A and B"* → *"What is A?"* + *"What is B?"*  
-
-### 3. Retrieval
-- Queries the **ChromaDB** vector store for all sub-queries, gathering potentially relevant chunks.  
-- Removes duplicates.  
-
-### 4. Reranking
-- Uses a **CrossEncoder** model to rerank results by direct relevance to your original query.  
-- The most important information is pushed to the top.  
-
-### 5. Synthesis
-- Combines the top-ranked documents into a context block.  
-- The `run_response_agent` uses this context + query to generate the final answer.  
-- Every claim is **cited** with its original source.  
+- The questions are synthetic (written by a 9B teacher from single chunks or chunk pairs). Some
+  comparison questions are contrived, and the unanswerable set is small (17 test questions).
+- The judge is an LLM (Gemma 4 12B, a different family from the generator and teacher). It has not been
+  calibrated against human grades.
+- The corpus is 5 documents (~170 pages). Retrieval differences that are within the CIs here may
+  matter on larger corpora.
+- Variants generated after a robustness fix use a 1,200-token answer budget instead of 700. Only
+  evidence-first answers approach that limit.

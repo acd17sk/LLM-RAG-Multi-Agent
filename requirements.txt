@@ -1,7 +1,11 @@
-PyMuPDF
-langchain
+# llama-server (the inference backend) comes from conda-forge, not pip:
+#   conda install -c conda-forge "llama.cpp=*=cuda130*"     (or the cpu build)
+pymupdf
 chromadb
-llama-cpp-python
-huggingface-hub
-numpy
 sentence-transformers
+huggingface-hub
+pydantic>=2
+pyyaml
+requests
+pytest
+docling

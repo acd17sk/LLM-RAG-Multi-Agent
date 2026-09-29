@@ -1,0 +1,70 @@
+# Leave-one-out ablations: each variant = configs/default.yaml with ONE change, so every row
+# isolates the effect of one technique. `v0_*` rows reproduce the original notebook design.
+# Variants overriding ingest.* get their own index under index/<name>/.
+variants:
+  # ---------- reference points
+  - name: v0_qwen3-0.6b              # original design: dense + rerank + decompose, prompt-only citations
+    overrides:
+      llm.repo_id: Qwen/Qwen3-0.6B-GGUF
+      llm.filename: Qwen3-0.6B-Q8_0.gguf
+      retrieval.mode: dense
+      agent.answer_mode: freetext
+      agent.verifier: none
+  - name: default                    # configs/default.yaml
+
+  # ---------- ingestion
+  - name: docling_parser
+    overrides: {ingest.parser: docling}
+  - name: chunk_600
+    overrides: {ingest.chunk_size: 600, ingest.chunk_overlap: 100}
+  - name: parent_child
+    overrides: {ingest.child_size: 300}
+  - name: contextual
+    overrides: {ingest.contextualize: true}
+
+  # ---------- retrieval
+  - name: dense_only
+    overrides: {retrieval.mode: dense}
+  - name: bm25_only
+    overrides: {retrieval.mode: sparse}
+  - name: splade_hybrid
+    overrides: {retrieval.sparse: splade}
+  - name: qwen3_embedding
+    overrides: {retrieval.embedding_model: Qwen/Qwen3-Embedding-0.6B, retrieval.query_prompt: query}
+  - name: no_rerank
+    overrides: {retrieval.reranker_model: null, agent.verifier: none}
+  - name: qwen3_reranker             # LLM-based reranker served by llama-server
+    overrides: {retrieval.reranker_backend: llama, agent.support_threshold: 0.5}
+  - name: no_decompose
+    overrides: {agent.decompose: false}
+
+  # ---------- generation and self-checking
+  - name: freetext_citations         # prompt-only citations (original answer style)
+    overrides: {agent.answer_mode: freetext, agent.verifier: none}
+  - name: no_verifier
+    overrides: {agent.verifier: none}
+  - name: evidence_first
+    overrides: {agent.answer_mode: grounded_evidence}
+  - name: nli_verifier
+    overrides: {agent.verifier: nli, agent.support_threshold: 0.5}
+  - name: self_correct
+    overrides: {agent.verifier: nli, agent.support_threshold: 0.5, agent.self_correct: true}
+  - name: crag
+    overrides: {agent.crag: true, agent.crag_threshold: 0.9}
+  - name: relevance_gate             # threshold from `python -m localrag calibrate` on dev
+    overrides: {agent.min_relevance: 0.95}
+
+  # ---------- model
+  - name: default_qwen3-0.6b
+    overrides:
+      llm.repo_id: Qwen/Qwen3-0.6B-GGUF
+      llm.filename: Qwen3-0.6B-Q8_0.gguf
+
+  # ---------- optional: RL / preference-tuned adapters (skipped until trained: python -m localrag train ...)
+  # compare dpo_answer / grpo_answer against nli_verifier (same settings, no adapter)
+  - name: dpo_answer
+    overrides: {llm.adapters: {answer: adapters/dpo.gguf}, agent.verifier: nli, agent.support_threshold: 0.5}
+  - name: grpo_answer
+    overrides: {llm.adapters: {answer: adapters/grpo.gguf}, agent.verifier: nli, agent.support_threshold: 0.5}
+  - name: grpo_decompose
+    overrides: {llm.adapters: {decompose: adapters/grpo-decompose.gguf}}

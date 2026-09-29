@@ -1,0 +1,9 @@
+index/
+logs/
+eval/results/*.jsonl
+__pycache__/
+.ipynb_checkpoints/
+.DS_Store
+adapters/
+eval/results_v1/*.jsonl
+!eval/results_v1/dataset_v1.jsonl
