@@ -17,14 +17,21 @@ ROUTE_SCHEMA = {
 
 
 def route(llm: LLM, query: str, corpus: str) -> str:
-    prompt = f"""You route questions for an assistant with a document knowledge base.
+    prompt = f"""You route messages for an assistant with a document knowledge base.
 Knowledge base: {corpus}
 
 Choose SEARCH if answering needs facts, definitions, requirements or details that could be in the knowledge base.
-Choose ANSWER_DIRECTLY only for greetings, small talk, or questions about the conversation itself.
+Choose ANSWER_DIRECTLY for greetings, thanks, small talk, or questions about the assistant itself.
 When unsure, choose SEARCH.
 
-Question: {query}"""
+Examples:
+"Hello!" -> ANSWER_DIRECTLY
+"Thanks, that was helpful." -> ANSWER_DIRECTLY
+"Who are you?" -> ANSWER_DIRECTLY
+"What does design validation require?" -> SEARCH
+"How should off-the-shelf software be documented?" -> SEARCH
+
+Message: {query}"""
     out = llm.json([{"role": "user", "content": prompt}], ROUTE_SCHEMA, max_tokens=20, temperature=0)
     return out["action"]
 

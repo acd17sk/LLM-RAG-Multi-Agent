@@ -34,11 +34,49 @@ Or open [`demo.ipynb`](demo.ipynb), where every option below is a parameter.
 
 ## How it works
 
+```mermaid
+flowchart LR
+    subgraph ING["① Ingestion · offline"]
+        direction TB
+        PDF[/"PDF documents"/] --> PARSE["<b>Parser</b><br/>pymupdf · docling"]
+        PARSE --> CHUNK["<b>Section-aware chunks</b><br/>heading paths · whole tables"]
+        CHUNK -. "contextualize" .-> CTXR["<b>Contextual retrieval</b><br/>LLM-written context"]
+        CHUNK -. "child_size" .-> CHILD["<b>Parent-child</b><br/>search small, read parent"]
+        CHUNK --> IDX[("<b>Indexes</b><br/>BM25 · SPLADE<br/>bi-encoder · ColBERT")]
+        CTXR -.-> IDX
+        CHILD -.-> IDX
+    end
+
+    subgraph RET["② Retrieval"]
+        direction TB
+        QUESTION(["Question"]) --> ROUTE{{"<b>Router</b>"}}
+        ROUTE -. "small talk" .-> DIRECT(["Direct answer"])
+        ROUTE --> DECOMP["<b>Decompose</b><br/>adapter: grpo-decompose"]
+        DECOMP --> SEARCH["<b>Hybrid search</b><br/>bm25 · splade<br/>bi_encoder · late_interaction"]
+        SEARCH --> FUSE["<b>RRF fusion</b>"]
+        FUSE --> RERANK["<b>Rerank</b><br/>cross_encoder · llama"]
+        RERANK --> CONTROL{{"<b>Strategy</b><br/>single · iterative · CRAG"}}
+        CONTROL -. "follow-up<br/>query" .-> SEARCH
+    end
+
+    subgraph GEN["③ Grounded answer"]
+        direction TB
+        GATE{{"<b>Relevance gate</b><br/>min_relevance"}} -. "too weak" .-> REFUSE(["Refuse"])
+        GATE --> CONTEXT["<b>Context</b><br/>chunk · window · section"]
+        CONTEXT --> COMPRESS["<b>Compression</b><br/>none · sentences"]
+        COMPRESS --> ANSWER["<b>Generation · 0.8B</b><br/>grounded · evidence · freetext<br/>adapter: dpo · dpo-refusal · grpo"]
+        ANSWER --> VERIFY{{"<b>Verify claims</b><br/>nli · reranker · none"}}
+        VERIFY -. "self_correct" .-> ANSWER
+        VERIFY --> OUT(["Cited answer"])
+    end
+
+    ING ==> RET ==> GEN
+
+    classDef opt stroke-dasharray: 5 5
+    class CTXR,CHILD,DECOMP opt
 ```
-PDF ─► parse ─► section-aware chunks ─► BM25/SPLADE + dense ─► RRF fusion ─► rerank
-                                                                               │
-answer ◄─ verify each claim (NLI) ◄─ grounded generation (claims + citation IDs) ◄┘
-```
+
+<sub>Each box lists its options, default first (see [Options](#options)). Dashed boxes and arrows are optional stages and loops.</sub>
 
 - **Grounded generation.** The model outputs JSON claims. Each citation must be the number of a passage actually shown, and llama.cpp's grammar enforces this, so even a 0.8B model can't cite a source that doesn't exist.
 - **Verification.** An NLI model checks every claim against its cited passages. Unsupported claims are dropped.
